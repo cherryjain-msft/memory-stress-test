@@ -5,28 +5,11 @@
     "appName": {
       "value": "memory-stress-tester"
     },
-    "environment": {
-      "value": "prod"
-    },
-    "appServicePlanSku": {
-      "value": "S1"
+    "skuName": {
+      "value": "B2"
     },
     "enableApplicationInsights": {
       "value": true
-    },
-    "defaultMemoryThresholdMB": {
-      "value": 1024
-    },
-    "maxAllowedMemoryThresholdMB": {
-      "value": 4096
-    },
-    "tags": {
-      "value": {
-        "Application": "MemoryStressTester",
-        "Environment": "Production",
-        "DeployedBy": "Bicep",
-        "Purpose": "Production"
-      }
     }
   }
 }

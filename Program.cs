@@ -7,7 +7,10 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// Add our memory management service
+// Add Application Insights telemetry
+builder.Services.AddApplicationInsightsTelemetry(builder.Configuration);
+
+// Add our memory management service with settings injection
 builder.Services.AddSingleton<IMemoryStressService, MemoryStressService>();
 
 // Configure memory limits

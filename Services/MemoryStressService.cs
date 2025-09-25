@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Options;
 
 namespace MemoryStressTester.Services;
 
@@ -15,15 +16,18 @@ public class MemoryStressService : IMemoryStressService, IDisposable
     private readonly ConcurrentDictionary<Guid, byte[]> _allocatedMemory;
     private readonly Timer _cleanupTimer;
     private readonly object _lock = new();
+    private readonly MemorySettings _settings;
     private bool _disposed = false;
 
-    public MemoryStressService()
+    public MemoryStressService(IOptions<MemorySettings> settings)
     {
+        _settings = settings.Value;
         _allocatedMemory = new ConcurrentDictionary<Guid, byte[]>();
         
-        // Cleanup timer to prevent indefinite memory growth
+        // More aggressive cleanup timer to prevent indefinite memory growth
         _cleanupTimer = new Timer(CleanupOldAllocations, null, 
-            TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+            TimeSpan.FromSeconds(_settings.CleanupIntervalSeconds), 
+            TimeSpan.FromSeconds(_settings.CleanupIntervalSeconds));
     }
 
     public async Task<MemoryAllocationResult> AllocateMemoryAsync(int megabytes, int thresholdMB)
@@ -33,6 +37,42 @@ public class MemoryStressService : IMemoryStressService, IDisposable
             var allocationId = Guid.NewGuid();
             var startMemory = GC.GetTotalMemory(false);
             var startTime = DateTime.UtcNow;
+
+            // Validate allocation size against configured limits
+            if (megabytes > _settings.MaxAllocationSizeMB)
+            {
+                return new MemoryAllocationResult
+                {
+                    Success = false,
+                    AllocationId = allocationId,
+                    RequestedMB = megabytes,
+                    ThresholdMB = thresholdMB,
+                    CurrentMemoryMB = GetCurrentMemoryUsageMB(),
+                    Message = $"Allocation size {megabytes}MB exceeds maximum allowed {_settings.MaxAllocationSizeMB}MB",
+                    IsThresholdExceeded = true
+                };
+            }
+
+            // Check dictionary size limits to prevent unbounded growth
+            if (_allocatedMemory.Count >= _settings.MaxConcurrentAllocations)
+            {
+                // Trigger aggressive cleanup before rejecting
+                EvictOldestAllocations(_allocatedMemory.Count / 3);
+                
+                if (_allocatedMemory.Count >= _settings.MaxConcurrentAllocations)
+                {
+                    return new MemoryAllocationResult
+                    {
+                        Success = false,
+                        AllocationId = allocationId,
+                        RequestedMB = megabytes,
+                        ThresholdMB = thresholdMB,
+                        CurrentMemoryMB = GetCurrentMemoryUsageMB(),
+                        Message = $"Maximum concurrent allocations ({_settings.MaxConcurrentAllocations}) reached. Clear existing allocations before creating new ones.",
+                        IsThresholdExceeded = true
+                    };
+                }
+            }
 
             // Check if we're about to exceed threshold
             var currentMemoryMB = GetCurrentMemoryUsageMB();
@@ -50,7 +90,13 @@ public class MemoryStressService : IMemoryStressService, IDisposable
                 };
             }
 
-            // Simulate memory allocation
+            // Proactive eviction if memory pressure is high
+            if (currentMemoryMB > _settings.LowMemoryEvictionThresholdMB && _allocatedMemory.Count > 10)
+            {
+                EvictOldestAllocations(_allocatedMemory.Count / 4);
+            }
+
+            // Simulate memory allocation with LOH awareness
             await Task.Run(() =>
             {
                 var bytes = new byte[megabytes * 1024 * 1024]; // Convert MB to bytes
@@ -74,7 +120,7 @@ public class MemoryStressService : IMemoryStressService, IDisposable
                 AllocationTimeMs = (endTime - startTime).TotalMilliseconds,
                 ThresholdMB = thresholdMB,
                 CurrentMemoryMB = GetCurrentMemoryUsageMB(),
-                Message = $"Successfully allocated {megabytes}MB"
+                Message = $"Successfully allocated {megabytes}MB (Active allocations: {_allocatedMemory.Count})"
             };
 
             // Check if we're now above threshold after allocation
@@ -84,6 +130,9 @@ public class MemoryStressService : IMemoryStressService, IDisposable
         }
         catch (OutOfMemoryException)
         {
+            // Force aggressive cleanup on OOM
+            EvictOldestAllocations(_allocatedMemory.Count / 2);
+            
             // Force garbage collection
             GC.Collect();
             GC.WaitForPendingFinalizers();
@@ -95,7 +144,7 @@ public class MemoryStressService : IMemoryStressService, IDisposable
                 RequestedMB = megabytes,
                 ThresholdMB = thresholdMB,
                 CurrentMemoryMB = GetCurrentMemoryUsageMB(),
-                Message = "Out of memory exception occurred during allocation",
+                Message = "Out of memory exception occurred during allocation. Some allocations were cleared.",
                 IsOutOfMemory = true,
                 IsThresholdExceeded = true
             };
@@ -155,16 +204,43 @@ public class MemoryStressService : IMemoryStressService, IDisposable
 
     private void CleanupOldAllocations(object? state)
     {
-        // Remove half of the allocations periodically to prevent indefinite growth
-        if (_allocatedMemory.Count > 10)
+        // More aggressive cleanup based on memory pressure
+        var currentMemoryMB = GetCurrentMemoryUsageMB();
+        var allocationCount = _allocatedMemory.Count;
+        
+        int itemsToRemove = 0;
+        
+        if (currentMemoryMB > _settings.LowMemoryEvictionThresholdMB)
         {
-            var keysToRemove = _allocatedMemory.Keys.Take(_allocatedMemory.Count / 2).ToList();
-            foreach (var key in keysToRemove)
-            {
-                _allocatedMemory.TryRemove(key, out _);
-            }
-            
-            GC.Collect();
+            // High memory pressure: remove 1/3 of allocations
+            itemsToRemove = Math.Max(allocationCount / 3, 1);
+        }
+        else if (allocationCount > _settings.MaxConcurrentAllocations / 2)
+        {
+            // Moderate allocation count: remove 1/4
+            itemsToRemove = Math.Max(allocationCount / 4, 1);
+        }
+        else if (allocationCount > 10)
+        {
+            // Light cleanup: remove a few old items
+            itemsToRemove = Math.Min(5, allocationCount / 4);
+        }
+        
+        if (itemsToRemove > 0)
+        {
+            EvictOldestAllocations(itemsToRemove);
+            GC.Collect(0); // Light GC collection
+        }
+    }
+
+    private void EvictOldestAllocations(int count)
+    {
+        if (count <= 0) return;
+
+        var keysToRemove = _allocatedMemory.Keys.Take(count).ToList();
+        foreach (var key in keysToRemove)
+        {
+            _allocatedMemory.TryRemove(key, out _);
         }
     }
 

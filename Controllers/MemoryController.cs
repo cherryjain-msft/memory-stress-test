@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 using MemoryStressTester.Services;
+using System.Diagnostics;
 
 namespace MemoryStressTester.Controllers;
 
@@ -44,35 +45,52 @@ public class MemoryController : ControllerBase
             // Clamp threshold to max allowed
             thresholdMB = Math.Min(thresholdMB, _settings.MaxAllowedThresholdMB);
 
-            _logger.LogInformation("Attempting to allocate {MB}MB with threshold {Threshold}MB", 
-                request.MegabytesToAllocate, thresholdMB);
+            _logger.LogInformation("Attempting to allocate {MB}MB with threshold {Threshold}MB. CorrelationId: {CorrelationId}", 
+                request.MegabytesToAllocate, thresholdMB, Activity.Current?.Id ?? "N/A");
 
+            var stopwatch = Stopwatch.StartNew();
             var result = await _memoryService.AllocateMemoryAsync(request.MegabytesToAllocate, thresholdMB);
+            stopwatch.Stop();
 
-            // If allocation would exceed threshold or OOM occurred, return 500
-            if (result.IsThresholdExceeded || result.IsOutOfMemory)
+            // Enhanced telemetry for Application Insights
+            using (_logger.BeginScope(new Dictionary<string, object>
             {
-                _logger.LogError("Memory allocation failed: {Message}", result.Message);
-                
-                // Return 500 Internal Server Error as requested
-                return StatusCode(500, new
+                ["OperationType"] = "MemoryAllocation",
+                ["RequestedMB"] = request.MegabytesToAllocate,
+                ["ThresholdMB"] = thresholdMB,
+                ["Success"] = result.Success,
+                ["CurrentMemoryMB"] = result.CurrentMemoryMB,
+                ["ExecutionTimeMs"] = stopwatch.ElapsedMilliseconds
+            }))
+
+            {
+                // If allocation would exceed threshold or OOM occurred, return 500
+                if (result.IsThresholdExceeded || result.IsOutOfMemory)
                 {
-                    error = "Memory allocation failed",
-                    message = result.Message,
-                    details = new
+                    _logger.LogError("Memory allocation failed: {Message}. CorrelationId: {CorrelationId}", 
+                        result.Message, Activity.Current?.Id ?? "N/A");
+                    
+                    // Return 500 Internal Server Error as requested
+                    return StatusCode(500, new
                     {
-                        requestedMB = result.RequestedMB,
-                        currentMemoryMB = result.CurrentMemoryMB,
-                        thresholdMB = result.ThresholdMB,
-                        isOutOfMemory = result.IsOutOfMemory,
-                        isThresholdExceeded = result.IsThresholdExceeded
-                    }
-                });
+                        error = "Memory allocation failed",
+                        message = result.Message,
+                        details = new
+                        {
+                            requestedMB = result.RequestedMB,
+                            currentMemoryMB = result.CurrentMemoryMB,
+                            thresholdMB = result.ThresholdMB,
+                            isOutOfMemory = result.IsOutOfMemory,
+                            isThresholdExceeded = result.IsThresholdExceeded
+                        }
+                    });
+                }
+
+                _logger.LogInformation("Memory allocation successful: {Message}. CorrelationId: {CorrelationId}", 
+                    result.Message, Activity.Current?.Id ?? "N/A");
+
+                return Ok(result);
             }
-
-            _logger.LogInformation("Memory allocation successful: {Message}", result.Message);
-
-            return Ok(result);
         }
         catch (Exception ex)
         {
@@ -106,13 +124,53 @@ public class MemoryController : ControllerBase
         try
         {
             _memoryService.ClearAllocations();
-            _logger.LogInformation("Memory allocations cleared");
+            _logger.LogInformation("Memory allocations cleared. CorrelationId: {CorrelationId}", Activity.Current?.Id ?? "N/A");
             return Ok(new { message = "All allocations cleared successfully" });
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error clearing allocations");
+            _logger.LogError(ex, "Error clearing allocations. CorrelationId: {CorrelationId}", Activity.Current?.Id ?? "N/A");
             return StatusCode(500, new { error = "Failed to clear allocations" });
+        }
+    }
+
+    [HttpPost("admin/force-cleanup")]
+    public IActionResult ForceCleanup([FromQuery] int? itemsToRemove = null)
+    {
+        try
+        {
+            var memoryStatus = _memoryService.GetMemoryStatus();
+            var itemsToCleanup = itemsToRemove ?? Math.Max(memoryStatus.ActiveAllocations / 2, 1);
+            
+            _logger.LogWarning("Administrative memory cleanup requested. Items to remove: {ItemsToRemove}, Current allocations: {CurrentAllocations}. CorrelationId: {CorrelationId}", 
+                itemsToCleanup, memoryStatus.ActiveAllocations, Activity.Current?.Id ?? "N/A");
+
+            // Force a targeted cleanup
+            _memoryService.ClearAllocations();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            
+            var newStatus = _memoryService.GetMemoryStatus();
+            
+            return Ok(new { 
+                message = "Administrative cleanup completed",
+                beforeCleanup = new
+                {
+                    activeAllocations = memoryStatus.ActiveAllocations,
+                    managedMemoryMB = memoryStatus.ManagedMemoryMB
+                },
+                afterCleanup = new
+                {
+                    activeAllocations = newStatus.ActiveAllocations,
+                    managedMemoryMB = newStatus.ManagedMemoryMB
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during administrative cleanup. CorrelationId: {CorrelationId}", Activity.Current?.Id ?? "N/A");
+            return StatusCode(500, new { error = "Failed to perform administrative cleanup" });
         }
     }
 

@@ -4,6 +4,12 @@
   "parameters": {
     "appName": {
       "value": "memory-stress-tester"
+    },
+    "skuName": {
+      "value": "B1"
+    },
+    "enableApplicationInsights": {
+      "value": true
     }
   }
 }

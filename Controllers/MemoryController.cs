@@ -27,15 +27,16 @@ public class MemoryController : ControllerBase
     {
         try
         {
-            // Validate request
+            // Enhanced validation
             if (request.MegabytesToAllocate <= 0)
             {
                 return BadRequest(new { error = "Megabytes to allocate must be greater than 0" });
             }
 
-            if (request.MegabytesToAllocate > 10240) // 10GB limit for safety
+            // Use settings-based limits instead of hardcoded values
+            if (request.MegabytesToAllocate > _settings.MaxAllocationSizeMB)
             {
-                return BadRequest(new { error = "Allocation request too large (max 10GB)" });
+                return BadRequest(new { error = $"Allocation request too large (max {_settings.MaxAllocationSizeMB}MB)" });
             }
 
             var thresholdMB = request.ThresholdMB ?? _settings.DefaultThresholdMB;
@@ -126,11 +127,34 @@ public class MemoryController : ControllerBase
     {
         try
         {
+            // Enhanced validation for stress test
+            if (request.Iterations <= 0)
+            {
+                return BadRequest(new { error = "Iterations must be greater than 0" });
+            }
+
+            if (request.MegabytesPerIteration <= 0)
+            {
+                return BadRequest(new { error = "Megabytes per iteration must be greater than 0" });
+            }
+
+            if (request.MegabytesPerIteration > _settings.MaxAllocationSizeMB)
+            {
+                return BadRequest(new { error = $"Allocation per iteration too large (max {_settings.MaxAllocationSizeMB}MB)" });
+            }
+
+            // Prevent stress tests that would exceed safe limits
+            var totalRequestedMB = request.Iterations * request.MegabytesPerIteration;
+            if (totalRequestedMB > _settings.MaxAllowedThresholdMB)
+            {
+                return BadRequest(new { error = $"Total stress test allocation ({totalRequestedMB}MB) exceeds safe limits. Consider reducing iterations or size per iteration." });
+            }
+
             var results = new List<MemoryAllocationResult>();
             var thresholdMB = request.ThresholdMB ?? _settings.DefaultThresholdMB;
 
-            _logger.LogInformation("Starting stress test with {Iterations} iterations of {MB}MB each", 
-                request.Iterations, request.MegabytesPerIteration);
+            _logger.LogInformation("Starting stress test with {Iterations} iterations of {MB}MB each (Total: {TotalMB}MB)", 
+                request.Iterations, request.MegabytesPerIteration, totalRequestedMB);
 
             for (int i = 0; i < request.Iterations; i++)
             {
